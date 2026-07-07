@@ -12,6 +12,9 @@ __pycache__/
 # pygame debug artifacts
 game/crash.log
 
+# session logs (one JSON per run, generated at runtime)
+game/runs/
+
 # OS
 .DS_Store
 Thumbs.db

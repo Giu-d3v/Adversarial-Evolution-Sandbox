@@ -364,3 +364,68 @@ HUD 上「善者存活率」就是这个东西的时间曲线（最近 220 tick 
 | `mut_rate` | [0, 1] | 子代 trait 噪声标准差 = max(0.02, mut_rate×0.25) |
 
 8 个 trait 在初始化时**全部独立 uniform[0,1]** 随机；颜色（hue）由 `(aggression, cooperation)` 映射；策略标签完全靠 trait 范围**后验分类**，不在代码里硬编码。
+
+---
+
+## 十、每局记录自动落盘
+
+每局游戏**退出时**（按 `ESC` / `R` 重置 / 关窗 / 崩溃）会**自动保存一份 JSON** 到 `game/runs/{时间戳}.json`，文件名格式 `YYYY-MM-DD_HH-MM-SS.json`。
+
+例：`game/runs/2026-07-07_23-41-39.json`
+
+### JSON 结构
+
+```json
+{
+  "timestamp": "2026-07-07_23-41-39",
+  "ended_reason": "ESC",                    // "ESC" / "reset" / "window-close" / "crash"
+  "ticks": 500,
+  "births": 218,
+  "deaths": 166,
+  "final": {
+    "pop": 132, "avgAgg": 0.54, "avgCoop": 0.52, "goodRate": 0.61,
+    "stage": "朴素合作", "maxGen": 2, "food": 60
+  },
+  "stage_transitions": [
+    {"tick": 1,   "stage": "起始混乱"},
+    {"tick": 60,  "stage": "朴素合作"},
+    {"tick": 93,  "stage": "未分化"},
+    ...
+  ],
+  "history": [
+    {"tick": 0, "pop": 80, "agg": 0.50, "coop": 0.50, "good": 0.50},
+    {"tick": 1, "pop": 80, "agg": 0.50, "coop": 0.50, "good": 0.50},
+    ...
+  ]
+}
+```
+
+### 字段说明
+
+| 字段 | 内容 |
+|---|---|
+| `ended_reason` | 退出原因 |
+| `final.*` | 退出瞬间的快照 |
+| `stage_transitions` | **完整**阶段切换序列（不受 220 tick 限制）—— 直接读出这局剧情 |
+| `history` | 最近 220 tick 的 4 个核心指标时间序列 —— 足够画 sparkline / 折线图 |
+
+### 用法示例
+
+**画 avgAgg / avgCoop / good 随时间变化**：
+
+```python
+import json, pathlib
+import matplotlib.pyplot as plt  # 或其他
+
+data = json.loads(pathlib.Path("game/runs/2026-07-07_23-41-39.json").read_text(encoding="utf-8"))
+h = data["history"]
+ticks = [p["tick"] for p in h]
+plt.plot(ticks, [p["agg"]  for p in h], label="avgAgg",  color="red")
+plt.plot(ticks, [p["coop"] for p in h], label="avgCoop", color="green")
+plt.plot(ticks, [p["good"] for p in h], label="goodRate",color="cyan", linestyle="--")
+plt.legend(); plt.show()
+```
+
+**对比多局**：把所有 runs/*.json 加载，叠加画折线。
+
+**跑实验**：种子 + 玩家干预 → 立刻 ESC → 看 JSON 里 `stage_transitions` 怎么走。`runs/` 已加入 `.gitignore`，不会污染仓库。

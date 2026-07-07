@@ -13,11 +13,14 @@ Test:  SDL_VIDEODRIVER=dummy python game/adversarial_evolution.py --ticks 200
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 import random
 import sys
 from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
 from typing import List, Tuple
 
 import pygame
@@ -40,6 +43,9 @@ FOOD_SPAWN_PER_TICK = 3       # cap food supply so pop can't grow forever
 # "善者" 定义：cooperation 性状高于此阈值视为好善疾恶倾向
 GOOD_COOP_THRESHOLD = 0.5
 HISTORY_MAX = 220              # HUD sparkline 保留多少 tick 的历史
+
+# session logging
+RUNS_DIR = Path(__file__).parent / "runs"
 
 TRAIT_NAMES = (
     "aggression",
@@ -172,6 +178,9 @@ class World:
         self.pop_hist: List[int] = []
         self.agg_hist: List[float] = []
         self.coop_hist: List[float] = []
+        # stage transitions for the run log
+        self.stage_transitions: List[dict] = []
+        self._last_stage: str = ""
         self._spawn_initial()
 
     # -- spawning ----------------------------------------------------------
@@ -369,6 +378,11 @@ class World:
         for h in (self.good_hist, self.pop_hist, self.agg_hist, self.coop_hist):
             if len(h) > HISTORY_MAX:
                 del h[: len(h) - HISTORY_MAX]
+        # track stage transitions (only when stage actually changes)
+        stage = self.current_stage()
+        if stage != self._last_stage:
+            self.stage_transitions.append({"tick": self.tick, "stage": stage})
+            self._last_stage = stage
 
     def current_stage(self) -> str:
         """Classify the current population into a book-derived label.
@@ -641,6 +655,52 @@ def _hls_to_rgb(h: float, l: float, s: float) -> Tuple[int, int, int]:
 # Main
 # ----------------------------------------------------------------------------
 
+def save_run(world: World, ended_reason: str) -> Path | None:
+    """Dump the current world state + per-tick metrics history to a timestamped
+    JSON file under runs/. Returns the saved path, or None on failure."""
+    try:
+        RUNS_DIR.mkdir(exist_ok=True)
+        ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        path = RUNS_DIR / f"{ts}.json"
+        # build time-series (downsampled if too long, but keep all transitions)
+        n = len(world.pop_hist)
+        history = [
+            {
+                "tick": i,
+                "pop": world.pop_hist[i],
+                "agg": round(world.agg_hist[i], 4),
+                "coop": round(world.coop_hist[i], 4),
+                "good": round(world.good_hist[i], 4),
+            }
+            for i in range(n)
+        ]
+        payload = {
+            "timestamp": ts,
+            "ended_reason": ended_reason,
+            "ticks": world.tick,
+            "births": world.births,
+            "deaths": world.deaths,
+            "final": {
+                "pop": len(world.agents),
+                "avgAgg": round(world._avg_trait("aggression"), 4),
+                "avgCoop": round(world._avg_trait("cooperation"), 4),
+                "goodRate": round(world.good_rate(), 4),
+                "stage": world.current_stage(),
+                "maxGen": max((a.generation for a in world.agents), default=0),
+                "food": len(world.food),
+            },
+            "stage_transitions": list(world.stage_transitions),
+            "history": history,
+        }
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
+                        encoding="utf-8")
+        return path
+    except Exception as e:
+        sys.stderr.write(f"[save_run] failed: {e}\n")
+        sys.stderr.flush()
+        return None
+
+
 def run_headless(ticks: int, seed: int | None) -> dict:
     pygame.init()
     pygame.display.set_mode((WORLD_W, WORLD_H))
@@ -684,13 +744,25 @@ def run_interactive() -> int:
             try:
                 for event in pygame.event.get():
                     if event.type == pygame.QUIT:
+                        path = save_run(world, "window-close")
+                        if path:
+                            sys.stderr.write(f"[saved] {path}\n")
+                            sys.stderr.flush()
                         return 0
                     if event.type == pygame.KEYDOWN:
                         if event.key == pygame.K_ESCAPE:
+                            path = save_run(world, "ESC")
+                            if path:
+                                sys.stderr.write(f"[saved] {path}\n")
+                                sys.stderr.flush()
                             return 0
                         if event.key == pygame.K_SPACE:
                             paused = not paused
                         elif event.key == pygame.K_r:
+                            path = save_run(world, "reset")
+                            if path:
+                                sys.stderr.write(f"[saved] {path}\n")
+                                sys.stderr.flush()
                             world = World()
                         elif event.key == pygame.K_n:
                             mode = "agent"
@@ -736,6 +808,14 @@ def run_interactive() -> int:
         try:
             with open(log_path, "w", encoding="utf-8") as f:
                 f.write(tb)
+        except Exception:
+            pass
+        # also save whatever run state we have so post-mortem is possible
+        try:
+            path = save_run(world, "crash")
+            if path:
+                sys.stderr.write(f"[saved on crash] {path}\n")
+                sys.stderr.flush()
         except Exception:
             pass
         sys.stderr.write(tb)
