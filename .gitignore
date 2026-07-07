@@ -1,0 +1,17 @@
+# upstream book clone (read-only reference, not our code)
+repo/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Claude Code session data
+.claude/
+
+# pygame debug artifacts
+game/crash.log
+
+# OS
+.DS_Store
+Thumbs.db
