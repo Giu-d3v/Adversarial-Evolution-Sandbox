@@ -184,3 +184,183 @@ SDL_VIDEODRIVER=dummy DEBUG_TELEMETRY=1 python -u game/adversarial_evolution.py 
 ## 七、来源
 
 书仓在工作区根 `repo/` 目录。所有游戏内术语译名以 `repo/核心词汇表.md` 为准。书中有一份作者自己写的离散策略模拟程序 `repo/对抗演化与合作跃升（下卷）——生命奇迹与永生哲学/03 附录/01 对抗演化模拟程序说明.md`，里面给出了 `修身 1.00 / 无条件利他 0.98 / 夺利 0.93 / TFT 0.80 / GVBE_1 0.60 ...` 的适应度参考表，是本游戏后续加「善选择 / punish」机制时的最佳数值校准起点。
+
+---
+
+## 八、八条核心动作的精确规则
+
+下面是每个 tick 里**每个个体**按顺序执行的 8 个动作，写的是当前代码 `game/adversarial_evolution.py` 里 `_agent_act` 和 `World.step` 的真实行为。括号里的数是默认参数。
+
+### 1️⃣ 代谢 (Metabolism) —— 每 tick 第一件事
+
+```
+self.energy -= 0.004 + 0.015 × self.metabolism
+```
+
+- `metabolism` ∈ [0, 1]，所以每 tick 扣 0.004 .. 0.019 能量
+- **能量上限** `MAX_ENERGY = 2.0`，**下限** 0（≤ 0 即死，见 8️⃣）
+- 平均 metab ≈ 0.5 → 每 tick 扣 ~0.012，满血 → 饿死约 **167 tick**
+
+### 2️⃣ 感知 (Sense) —— 决定本 tick 谁能影响你
+
+```
+sense_radius = 18 + 80 × self.sense   # 像素
+neighbors = 距自己 < sense_radius 的所有个体 (toroidal)
+```
+
+- `sense` ∈ [0, 1]，所以半径 18 .. 98 像素
+- 屏幕宽度 960，半径 98 大概覆盖屏幕 ~10% 区域
+- 低 sense ≈ 半瞎子 ≈ **天然修身**（无法攻击/分享也找不到食物）
+
+### 3️⃣ 攻击 (夺利)
+
+```
+if self.energy < 0.45  AND  neighbors  AND  random() < self.aggression:
+    target = neighbors 里 energy 最低的 (加 0~0.05 随机扰动打破平局)
+    if target.energy < self.energy × 1.4:        # 不打比自己强 40% 以上的
+        taken = 0.35 × (1 - 0.6 × target.defense)
+        self.energy  += taken - 0.06              # 攻击者：得 stolen - 夺利税
+        target.energy -= taken                    # 目标：直接扣 stolen
+```
+
+**能量公式（典型 agg=0.8, target.defense=0.3）**：
+- `taken = 0.35 × (1 - 0.18) = 0.287`
+- 攻击者净得：`+0.287 - 0.06 = +0.227`
+- 目标净失：`-0.287`
+- 系统净损耗：`0.06`（夺利税） —— 这就是 `1+1<2` 的精确实现
+
+**触发不到的原因**：① 能量 ≥ 0.45（不饿就懒得打）② 周围没人 ③ aggression 太低 ④ 对方比自己强太多 ⑤ 这 tick 的 random 摇骰没命中
+
+### 4️⃣ 分享 (合作)
+
+```
+if neighbors  AND  random() < self.cooperation × 0.6:
+    same = [o for o in neighbors if hue距离(o) < 35°]
+    if same:
+        partner = same 里距离最近的
+        if self.energy > 0.5  AND  partner.energy < 0.7:
+            self.energy    -= 0.06
+            partner.energy += 0.06            # 1:1 转移
+```
+
+**严格说这是 `1+1=2`，不是 `1+1>2`**。字面 `1+1>2` 在当前代码里是**间接涌现**：同色分享 → 自然聚簇 → 聚簇里多个分享流叠加 → 整体比独行者活得久 → 集群红利 ≈ 1+1>2。
+
+**触发不到的原因**：① 周围没**同色**邻居（hue 距 ≥ 35°，隐形门槛）② cooperation 太低 ③ 自己能量 ≤ 0.5（不愿分）④ 对方能量 ≥ 0.7（已经够了不贪）
+
+### 5️⃣ 移动
+
+```
+speed = 1 + 6 × self.speed            # 每 tick 移动 1..7 像素
+if self.energy < 0.94:                # 没吃饱到能繁殖
+    bias = 朝最近食物的单位向量
+else:
+    bias = (0, 0)                     # 吃饱就乱走
+direction = 0.6 × 随机单位向量 + 0.4 × bias
+self.x += direction.x × speed         # toroidal 环绕
+self.y += direction.y × speed
+```
+
+- 阈值 `0.94 = REPRO_BASE + REPRO_SCALE × 0.4 = 0.85 + 0.5×0.4`
+- 关键设计：**一旦能量过繁殖阈值的 80%，就不再偏向食物**，逼个体持续探索
+
+### 6️⃣ 吃
+
+```
+for food in self.food:
+    if 这 tick 还没吃过  AND  |food.x - self.x| < 8  AND  |food.y - self.y| < 8:
+        self.energy = min(2.0, self.energy + food.amount)
+        吃掉这团食物
+        标记 ate = True
+```
+
+- 食物初始值 0.25 .. 0.55，**每 tick 每个体最多吃 1 团**
+- 食物被吃后从 `self.food` 列表移除
+
+### 7️⃣ 繁殖
+
+```
+repro_need = 0.85 + 0.5 × self.repro_thr    # 0.85 .. 1.35
+if self.energy > repro_need  AND  random() < 0.05:
+    child = clone(self) with traits += Gaussian(0, max(0.02, mut_rate × 0.25))
+    self.energy /= 2                          # 一半能量给子代
+```
+
+- `repro_thr` ∈ [0, 1] 决定繁殖门槛
+- 子代 8 个 trait 各自独立加一个高斯噪声，噪声标准差 = `max(0.02, mut_rate × 0.25)`
+- 能量按 50/50 切（父 + 子总和不变）
+- **5% 每 tick** 是关键低概率 —— 防止爆炸，但阈值一旦突破就会持续尝试
+
+### 8️⃣ 死亡
+
+```
+if self.energy <= 0: die()
+```
+
+- **唯一死因**：能量耗尽（饿死 / 被抢死 / 被分享耗光）
+- **没有自然衰老** —— `Agent.age` 字段记了但**完全不用**
+- 死亡时 `world.deaths += 1`，agent 从 `self.agents` 移除
+
+---
+
+## 九、其他常被问到的规则
+
+### 同色判定（决定谁能跟谁分享）
+
+```python
+def trait_hue(t):
+    return degrees(atan2(t.aggression - 0.5, t.cooperation - 0.5)) % 360
+```
+
+- `hue 距 < 35°` 算同色
+- 同色判定只在**分享**时用，不影响攻击（攻击谁都可以）
+
+### 食物 spawn
+
+```
+target = max(20, FOOD_TARGET)          # 当前 FOOD_TARGET = 140
+if len(food) < target:
+    spawn FOOD_SPAWN_PER_TICK = 3 团，每团 amount = 0.25..0.55，位置全随机
+```
+
+- 食物总量是**绝对值**，不随人口扩张 → 人口膨胀时单位个体食物下降 → **密度依赖的生存压力**自然涌现
+
+### 阶段分类（自动判定当前剧情阶段）
+
+每 tick 调用 `World.current_stage()`，按以下优先级匹配第一个条件：
+
+| 顺序 | 阶段 | 触发条件 |
+|---|---|---|
+| 1 | 起始混乱 | tick < 60 |
+| 2 | 空 | 无活体 |
+| 3 | 濒临灭绝 | pop < 25 |
+| 4 | 霍布斯丛林 | avgAgg > 0.72 **且** avgCoop < 0.40 |
+| 5 | 伊甸园期 | avgCoop > 0.55 **且** avgAgg < 0.50 **且** pop Δ < ±20 (近 60 tick) |
+| 6 | 合作繁荣中 | avgCoop > 0.50 **且** avgAgg < 0.55 **且** pop Δ > +25 |
+| 7 | 维度坍缩中 | pop Δ < -40 (近 60 tick) |
+| 8 | 夺利丛林 | avgAgg > 0.62 |
+| 9 | 朴素合作 | avgCoop > 0.48 **且** good_rate > 0.35 |
+| 10 | 修身主导 | avgAgg < 0.40 **且** avgCoop < 0.40 |
+| 11 | 未分化 | 其余 |
+
+### 善者（good）的定义
+
+```
+good_rate = fraction(agents where cooperation > 0.5)
+```
+
+HUD 上「善者存活率」就是这个东西的时间曲线（最近 220 tick 的 sparkline）。
+
+### 游戏里的「8 个 trait」具体行为
+
+| trait | 取值 | 影响 |
+|---|---|---|
+| `aggression` | [0, 1] | 攻击摇骰命中率（饥饿时） |
+| `cooperation` | [0, 1] | 分享摇骰命中率（实际阈值 = 此值 × 0.6） |
+| `metabolism` | [0, 1] | 每 tick 能量扣除系数 |
+| `speed` | [0, 1] | 每 tick 移动 1+6×speed 像素 |
+| `sense` | [0, 1] | 感知半径 18+80×sense 像素 |
+| `defense` | [0, 1] | 被攻击时减伤（最多减 60% 的 stolen） |
+| `repro_thr` | [0, 1] | 繁殖能量门槛 0.85+0.5×repro_thr |
+| `mut_rate` | [0, 1] | 子代 trait 噪声标准差 = max(0.02, mut_rate×0.25) |
+
+8 个 trait 在初始化时**全部独立 uniform[0,1]** 随机；颜色（hue）由 `(aggression, cooperation)` 映射；策略标签完全靠 trait 范围**后验分类**，不在代码里硬编码。
