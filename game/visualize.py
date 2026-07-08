@@ -18,9 +18,11 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from datetime import datetime
+from glob import glob
 from html import escape
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 
 try:
     import plotly.graph_objects as go
@@ -64,6 +66,21 @@ def _stage_color(stage: str) -> str:
     return STAGE_COLORS.get(stage, DEFAULT_STAGE_COLOR)
 
 
+def downsample_history(history: List[Dict[str, Any]], n: int) -> List[Dict[str, Any]]:
+    """Uniform-stride downsample to ~n points, keeping first AND last.
+    Returns the original list if shorter than 2n (no benefit)."""
+    if n <= 0 or len(history) <= 2 * n:
+        return history
+    stride = len(history) / n
+    out = []
+    for i in range(n):
+        out.append(history[int(i * stride)])
+    # ensure last point is the actual last
+    if out[-1] is not history[-1]:
+        out.append(history[-1])
+    return out
+
+
 # === Loading ===
 def load_runs(paths: List[Path]) -> List[Dict[str, Any]]:
     """Load each path as a JSON run dict. Skip files that don't parse."""
@@ -93,9 +110,10 @@ def _try_load(path: Path, out: List[Dict[str, Any]]) -> None:
 
 
 # === §1 时间序列 ===
-def build_timeseries(runs: List[Dict[str, Any]]) -> go.Figure:
+def build_timeseries(runs: List[Dict[str, Any]], downsample: int = 0) -> go.Figure:
     """4 stacked subplots: avgAgg / avgCoop / good / pop vs tick.
-    Each run is a separate trace (color-coded)."""
+    Each run is a separate trace (color-coded). If downsample > 0, each run's
+    history is reduced to ~N points (strided, first+last preserved)."""
     fig = make_subplots(
         rows=4, cols=1, shared_xaxes=True,
         subplot_titles=("avgAgg (种群平均攻击性)",
@@ -108,7 +126,7 @@ def build_timeseries(runs: List[Dict[str, Any]]) -> go.Figure:
     for i, run in enumerate(runs):
         color = RUN_COLORS[i % len(RUN_COLORS)]
         label = run["_label"]
-        history = run.get("history", [])
+        history = downsample_history(run.get("history", []), downsample) if downsample else run.get("history", [])
         if not history:
             continue
         xs = [h["tick"] for h in history]
@@ -137,47 +155,55 @@ def build_timeseries(runs: List[Dict[str, Any]]) -> go.Figure:
 
 # === §2 阶段时间线 ===
 def build_stage_timeline(runs: List[Dict[str, Any]]) -> go.Figure:
-    """Each run gets a horizontal lane; colored blocks for each stage segment."""
+    """Each run gets a horizontal lane with one Bar trace containing all segments
+    (each segment is a separate bar inside the trace with its own color).
+    Trace count == run count (NOT segment count) — much faster for many runs.
+    """
     fig = go.Figure()
     n = len(runs)
-    # y-axis: run index (top = newest), each lane is height 1
+    max_ticks = 0
     for i, run in enumerate(runs):
         y_pos = n - i  # newest on top
         transitions = run.get("stage_transitions", [])
         if not transitions:
             continue
-        # extend the last transition through end-of-run
         end_tick = run.get("ticks", transitions[-1]["tick"])
-        # build segments
-        segments = []
+        max_ticks = max(max_ticks, end_tick)
+        # collect per-segment arrays
+        starts, durations, colors, stages = [], [], [], []
         for j, tr in enumerate(transitions):
             start = tr["tick"]
             end = transitions[j + 1]["tick"] if j + 1 < len(transitions) else end_tick
-            segments.append((start, end, tr["stage"]))
-        # plot as one trace per segment for hover details
-        for start, end, stage in segments:
             if end <= start:
                 continue
-            fig.add_trace(go.Bar(
-                x=[end - start],
-                y=[y_pos],
-                base=[start],
-                orientation="h",
-                marker_color=_stage_color(stage),
-                marker_line_width=0,
-                name=stage,
-                legendgroup=stage,
-                showlegend=(i == 0 and stage not in {t.name for t in fig.data}),
-                hovertemplate=(f"<b>{escape(run['_label'])}</b><br>"
-                               f"{escape(stage)}<br>"
-                               f"tick {start} → {end}<br>"
-                               f"duration {end - start}<extra></extra>"),
-            ))
+            starts.append(start)
+            durations.append(end - start)
+            colors.append(_stage_color(tr["stage"]))
+            stages.append(tr["stage"])
+        if not starts:
+            continue
+        # ONE trace per run, multiple bars inside (same y_pos, different x/color)
+        fig.add_trace(go.Bar(
+            x=durations,
+            y=[y_pos] * len(starts),
+            base=starts,
+            orientation="h",
+            marker_color=colors,
+            marker_line_width=0,
+            name=run["_label"],
+            legendgroup=run["_label"],
+            showlegend=False,
+            customdata=stages,  # for hover
+            hovertemplate=(f"<b>{escape(run['_label'])}</b><br>"
+                           "stage: %{customdata}<br>"
+                           "tick: %{base} → %{x:+d}<extra></extra>"),
+        ))
     fig.update_layout(
         height=max(300, 60 * n + 100),
         barmode="overlay",
         title_text="§2 阶段时间线 — 每行一局，背景色块=阶段",
-        xaxis=dict(title="tick", range=[0, max((r.get("ticks", 0) for r in runs), default=0) * 1.05]),
+        xaxis=dict(title="tick",
+                   range=[0, max_ticks * 1.05 if max_ticks else 1]),
         yaxis=dict(
             title="run (最新在上)",
             tickvals=list(range(1, n + 1)),
@@ -192,9 +218,12 @@ def build_stage_timeline(runs: List[Dict[str, Any]]) -> go.Figure:
 
 
 # === §3 (agg, coop) 2D 轨迹 ===
-def build_trajectory(runs: List[Dict[str, Any]]) -> go.Figure:
+def build_trajectory(runs: List[Dict[str, Any]], downsample: int = 0,
+                     stage_by_tick: Dict[str, List[str]] | None = None) -> go.Figure:
     """Scatter+line plot: each tick a (avgAgg, avgCoop) point.
-    Lines+markers, color-graded by time."""
+    Lines+markers, color-graded by time. If downsample > 0, history is
+    strided to ~N points. stage_by_tick (optional) maps run-label -> per-tick
+    stage label, used in hover."""
     fig = go.Figure()
     # neutral zone rectangle (未分化 in classification)
     fig.add_shape(
@@ -222,19 +251,26 @@ def build_trajectory(runs: List[Dict[str, Any]]) -> go.Figure:
         )
     # trajectory lines
     for i, run in enumerate(runs):
-        history = run.get("history", [])
+        history = downsample_history(run.get("history", []), downsample) if downsample else run.get("history", [])
         if not history:
             continue
         color = RUN_COLORS[i % len(RUN_COLORS)]
         xs = [h["agg"] for h in history]
         ys = [h["coop"] for h in history]
+        custom = [str(h["tick"]) for h in history]
+        stages = None
+        if stage_by_tick and run["_label"] in stage_by_tick:
+            stages = stage_by_tick[run["_label"]]
+        customdata = list(zip(custom, stages)) if stages else custom
+        extra = "agg=%{x:.3f}<br>coop=%{y:.3f}<br>tick=%{customdata[0]}<br>stage=%{customdata[1]}<extra></extra>" if stages \
+                else "agg=%{x:.3f}<br>coop=%{y:.3f}<extra></extra>"
         fig.add_trace(go.Scatter(
             x=xs, y=ys, mode="lines+markers",
             name=run["_label"],
             line=dict(color=color, width=2),
             marker=dict(size=4, color=color),
-            hovertemplate=(f"<b>{escape(run['_label'])}</b><br>"
-                           "agg=%{x:.3f}<br>coop=%{y:.3f}<extra></extra>"),
+            customdata=customdata,
+            hovertemplate=(f"<b>{escape(run['_label'])}</b><br>" + extra),
         ))
     fig.update_layout(
         height=550,
@@ -247,34 +283,34 @@ def build_trajectory(runs: List[Dict[str, Any]]) -> go.Figure:
 
 
 # === §4 多局终态总结 ===
-def build_summary(runs: List[Dict[str, Any]]) -> List[go.Figure]:
-    """Three figures: stage distribution, (agg, coop) end-state scatter, table."""
-    figs = []
+def build_summary(runs: List[Dict[str, Any]]) -> Tuple[go.Figure, go.Figure, str]:
+    """Returns (stage_dist_fig, endstate_scatter_fig, table_html).
 
+    Three parts: bar chart of end-stage distribution, scatter of (avgAgg, avgCoop)
+    end states colored by stage, and a per-run summary table as raw HTML.
+    """
     # 4a: end-stage distribution
     stage_counts: Dict[str, int] = {}
     for r in runs:
         s = r.get("final", {}).get("stage", "?")
         stage_counts[s] = stage_counts.get(s, 0) + 1
     items = sorted(stage_counts.items(), key=lambda kv: -kv[1])
-    fig1 = go.Figure(go.Bar(
+    fig_dist = go.Figure(go.Bar(
         x=[k for k, _ in items],
         y=[v for _, v in items],
         marker_color=[_stage_color(k) for k, _ in items],
         text=[v for _, v in items],
         textposition="outside",
     ))
-    fig1.update_layout(
+    fig_dist.update_layout(
         height=380,
         title_text=f"§4a 末态阶段分布 ({len(runs)} 局)",
         xaxis_title="stage", yaxis_title="count",
     )
-    figs.append(fig1)
 
     # 4b: end-state (avgAgg, avgCoop) scatter
-    fig2 = go.Figure()
-    # neutral rect again
-    fig2.add_shape(
+    fig_scatter = go.Figure()
+    fig_scatter.add_shape(
         type="rect",
         x0=NEUTRAL_RECT["x0"], x1=NEUTRAL_RECT["x1"],
         y0=NEUTRAL_RECT["y0"], y1=NEUTRAL_RECT["y1"],
@@ -285,21 +321,20 @@ def build_summary(runs: List[Dict[str, Any]]) -> List[go.Figure]:
     ys = [r.get("final", {}).get("avgCoop", 0) for r in runs]
     colors = [_stage_color(r.get("final", {}).get("stage", "未分化")) for r in runs]
     labels = [r["_label"] for r in runs]
-    fig2.add_trace(go.Scatter(
+    fig_scatter.add_trace(go.Scatter(
         x=xs, y=ys, mode="markers",
         marker=dict(size=12, color=colors, line=dict(width=1, color="#222")),
         text=labels,
         hovertemplate="<b>%{text}</b><br>agg=%{x:.3f}<br>coop=%{y:.3f}<extra></extra>",
     ))
-    fig2.update_layout(
+    fig_scatter.update_layout(
         height=450,
         xaxis=dict(title="avgAgg (末)", range=[0, 1], constrain="domain"),
         yaxis=dict(title="avgCoop (末)", range=[0, 1], scaleanchor="x", scaleratio=1),
         title_text="§4b 末态 (avgAgg, avgCoop) — 颜色=末态阶段",
     )
-    figs.append(fig2)
 
-    # 4c: summary table as HTML
+    # 4c: summary table as raw HTML
     rows_html = []
     for r in runs:
         f = r.get("final", {})
@@ -323,8 +358,7 @@ def build_summary(runs: List[Dict[str, Any]]) -> List[go.Figure]:
         "<th>avgAgg</th><th>avgCoop</th><th>good</th><th>末态阶段</th><th>maxGen</th>"
         "</tr></thead><tbody>" + "".join(rows_html) + "</tbody></table>"
     )
-    figs.append(table_html)  # type: ignore  (string passed downstream)
-    return figs
+    return fig_dist, fig_scatter, table_html
 
 
 # === HTML composition ===
@@ -389,14 +423,38 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 """
 
 
-def compose_html(runs: List[Dict[str, Any]]) -> str:
-    fig_ts = build_timeseries(runs)
-    fig_tl = build_stage_timeline(runs)
-    fig_tr = build_trajectory(runs)
-    summary_figs = build_summary(runs)
-    fig_dist, fig_scatter, table_html = summary_figs[0], summary_figs[1], summary_figs[2]
+def build_stage_by_tick(run: Dict[str, Any]) -> List[str]:
+    """For each tick in run['history'], return the stage that was active.
+    Same length as history."""
+    history = run.get("history", [])
+    transitions = run.get("stage_transitions", [])
+    if not history or not transitions:
+        return ["?"] * len(history)
+    # build (tick, stage) sorted list of transitions
+    segs = []
+    end_tick = run.get("ticks", transitions[-1]["tick"])
+    for j, tr in enumerate(transitions):
+        end = transitions[j + 1]["tick"] if j + 1 < len(transitions) else end_tick
+        segs.append((tr["tick"], end, tr["stage"]))
+    out = []
+    si = 0
+    for h in history:
+        t = h["tick"]
+        # advance si until seg covers t
+        while si < len(segs) and segs[si][1] <= t:
+            si += 1
+        out.append(segs[si][2] if si < len(segs) else "?")
+    return out
 
-    # serialize all figures
+
+def compose_html(runs: List[Dict[str, Any]], downsample: int = 0) -> str:
+    fig_ts = build_timeseries(runs, downsample=downsample)
+    fig_tl = build_stage_timeline(runs)
+    # compute stage-by-tick map for §3 hover (only needed if not downsampled)
+    stage_by_tick = {r["_label"]: build_stage_by_tick(r) for r in runs}
+    fig_tr = build_trajectory(runs, downsample=downsample, stage_by_tick=stage_by_tick)
+    fig_dist, fig_scatter, table_html = build_summary(runs)
+
     fig_data = {
         "timeseries": fig_ts.to_dict(),
         "timeline": fig_tl.to_dict(),
@@ -405,9 +463,7 @@ def compose_html(runs: List[Dict[str, Any]]) -> str:
         "summary_scatter": fig_scatter.to_dict(),
     }
 
-    # header metadata
-    import datetime
-    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     meta_lines = []
     for r in runs:
         f = r.get("final", {})
@@ -432,10 +488,20 @@ def main(argv: List[str]) -> int:
     parser.add_argument("paths", nargs="+", help="JSON 文件 / 目录 / glob")
     parser.add_argument("--out", "-o", default=None,
                         help="输出 HTML 路径 (默认 runs/report.html)")
+    parser.add_argument("--last", type=int, default=0,
+                        help="只保留最近 N 局 (按 timestamp 排序)")
+    parser.add_argument("--stage", type=str, default=None,
+                        help="只保留末态阶段包含此子串的局 (如 '霍布斯', '未分化')")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="只保留某 seed 的局 (通过 ended_reason 或路径含 seed 判定)")
+    parser.add_argument("--sort", choices=["time", "pop", "agg", "coop", "good", "ticks"],
+                        default="time",
+                        help="排序方式 (默认 time)")
+    parser.add_argument("--downsample", type=int, default=0,
+                        help="每条时间序列保留 ~N 个点 (0=不抽样, 推荐 200 控制 HTML 大小)")
     args = parser.parse_args(argv)
 
     # expand globs
-    from glob import glob
     expanded: List[Path] = []
     for p in args.paths:
         if "*" in p or "?" in p:
@@ -448,9 +514,50 @@ def main(argv: List[str]) -> int:
         sys.stderr.write("[error] no runs loaded. Check paths.\n")
         return 1
 
+    # filter by stage
+    if args.stage:
+        before = len(runs)
+        runs = [r for r in runs
+                if args.stage in r.get("final", {}).get("stage", "")]
+        sys.stderr.write(f"[filter] --stage '{args.stage}': {before} -> {len(runs)} runs\n")
+
+    # filter by seed (look for seed=N in filename or ended_reason)
+    if args.seed is not None:
+        before = len(runs)
+        target = f"seed={args.seed}"
+        runs = [r for r in runs
+                if target in r.get("_filename", "")
+                or target in r.get("ended_reason", "")]
+        sys.stderr.write(f"[filter] --seed {args.seed}: {before} -> {len(runs)} runs\n")
+
+    # sort
+    if args.sort == "time":
+        runs.sort(key=lambda r: r.get("timestamp", ""))
+    elif args.sort == "pop":
+        runs.sort(key=lambda r: r.get("final", {}).get("pop", 0), reverse=True)
+    elif args.sort == "agg":
+        runs.sort(key=lambda r: r.get("final", {}).get("avgAgg", 0), reverse=True)
+    elif args.sort == "coop":
+        runs.sort(key=lambda r: r.get("final", {}).get("avgCoop", 0), reverse=True)
+    elif args.sort == "good":
+        runs.sort(key=lambda r: r.get("final", {}).get("goodRate", 0), reverse=True)
+    elif args.sort == "ticks":
+        runs.sort(key=lambda r: r.get("ticks", 0), reverse=True)
+
+    # keep only last N
+    if args.last and args.last > 0 and len(runs) > args.last:
+        sys.stderr.write(f"[filter] --last {args.last}: keep latest {args.last} of {len(runs)}\n")
+        runs = runs[-args.last:]
+
+    if not runs:
+        sys.stderr.write("[error] no runs after filtering.\n")
+        return 1
+
     out_path = Path(args.out) if args.out else Path("runs/report.html")
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    html = compose_html(runs)
+    if args.downsample > 0:
+        sys.stderr.write(f"[downsample] ~{args.downsample} points per series\n")
+    html = compose_html(runs, downsample=args.downsample)
     out_path.write_text(html, encoding="utf-8")
     print(f"[ok] wrote {out_path} ({len(runs)} runs)")
     return 0
