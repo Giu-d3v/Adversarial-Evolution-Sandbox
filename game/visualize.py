@@ -513,6 +513,8 @@ def main(argv: List[str]) -> int:
                         help="排序方式 (默认 time)")
     parser.add_argument("--downsample", type=int, default=0,
                         help="每条时间序列保留 ~N 个点 (0=不抽样, 推荐 200 控制 HTML 大小)")
+    parser.add_argument("--no-open", action="store_true",
+                        help="生成后不自动打开浏览器 (默认会打开)")
     args = parser.parse_args(argv)
 
     # expand globs
@@ -574,6 +576,16 @@ def main(argv: List[str]) -> int:
     html = compose_html(runs, downsample=args.downsample)
     out_path.write_text(html, encoding="utf-8")
     print(f"[ok] wrote {out_path} ({len(runs)} runs)")
+
+    # auto-open in default browser (skip with --no-open)
+    if not args.no_open:
+        try:
+            import webbrowser
+            abs_path = out_path.resolve()
+            webbrowser.open(f"file://{abs_path}")
+            print(f"[ok] opened in browser")
+        except Exception as e:
+            sys.stderr.write(f"[warn] could not open browser: {e}\n")
     return 0
 
 
