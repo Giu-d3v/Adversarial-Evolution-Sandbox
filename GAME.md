@@ -240,7 +240,35 @@ JSON 结构：
 }
 ```
 
-`game/runs/` 已加入 `.gitignore`，不污染仓库。可以用 `matplotlib` 加载多份 JSON 叠加画对比图。
+`game/runs/` 已加入 `.gitignore`，不污染仓库。
+
+### 把记录做成可视化报告
+
+用 `game/visualize.py` 把 JSON 转成**单个自包含 HTML 报告**（plotly 交互图，双击浏览器就能看）：
+
+```bash
+# 单局
+python game/visualize.py game/runs/2026-07-08_13-26-15.json
+
+# 多局对比（自动叠加）
+python game/visualize.py game/runs/ --out game/runs/report.html
+
+# 多局（glob 形式）
+python game/visualize.py "game/runs/*.json" --out report.html
+```
+
+报告分 4 节：
+
+| 节 | 内容 |
+|---|---|
+| §1 时间序列 | 4 子图：avgAgg / avgCoop / good / pop vs tick，多局不同颜色叠加 |
+| §2 阶段时间线 | 每局一行，背景色块=阶段（霍布斯/坍缩=红，伊甸园/繁荣=绿，夺利=橙，未分化=灰）|
+| §3 (agg, coop) 2D 轨迹 | 把每局的 (avgAgg, avgCoop) 画在 2D 平面上，直观看到种群在性状空间怎么漂；标注 4 个策略角 + 未分化带 |
+| §4 多局终态总结 | 末态阶段柱状图 + 末态 (agg, coop) 散点图 + 关键指标表 |
+
+依赖：`pip install plotly`（plotly>=5.0 已加进 `requirements.txt`）。
+
+输出默认 `runs/report.html`，自包含（CDN 引用 plotly.js），可邮件附件、可双击打开。
 
 ---
 
