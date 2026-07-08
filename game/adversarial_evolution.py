@@ -30,7 +30,7 @@ import pygame
 # ----------------------------------------------------------------------------
 
 WORLD_W, WORLD_H = 960, 720
-HUD_TOP_H = 128
+HUD_TOP_H = 168
 HUD_BOTTOM_H = 56
 PLAY_W, PLAY_H = WORLD_W, WORLD_H - HUD_TOP_H - HUD_BOTTOM_H
 PLAY_OFFSET_Y = HUD_TOP_H
@@ -49,7 +49,7 @@ LOW_THRESH  = 0.4   # trait <  此值 = "低"
 # AGENT_LABELS is the canonical list, in a stable display order
 AGENT_LABELS = ("夺利", "互助合作", "好善疾恶", "修身", "未分化")
 
-HISTORY_MAX = 220              # HUD sparkline 保留多少 tick 的历史
+HISTORY_MAX = 2000             # HUD sparkline 保留多少 tick 的历史
 
 # session logging
 RUNS_DIR = Path(__file__).parent / "runs"
@@ -246,6 +246,10 @@ class World:
         self.pop_hist: List[int] = []
         self.agg_hist: List[float] = []
         self.coop_hist: List[float] = []
+        # per-strategy-category fraction over time (5 lines for the HUD chart)
+        self.cat_hist: Dict[str, List[float]] = {
+            label: [] for label in AGENT_LABELS
+        }
         # stage transitions for the run log
         self.stage_transitions: List[dict] = []
         self._last_stage: str = ""
@@ -452,8 +456,15 @@ class World:
         self.pop_hist.append(len(self.agents))
         self.agg_hist.append(self._avg_trait("aggression"))
         self.coop_hist.append(self._avg_trait("cooperation"))
+        # per-category fractions
+        counts = self._strategy_counts()
+        pop = max(1, len(self.agents))
+        for label in AGENT_LABELS:
+            self.cat_hist[label].append(counts[label] / pop)
         # trim to ring buffer length
-        for h in (self.good_hist, self.pop_hist, self.agg_hist, self.coop_hist):
+        all_hist = (self.good_hist, self.pop_hist, self.agg_hist, self.coop_hist,
+                    *[self.cat_hist[l] for l in AGENT_LABELS])
+        for h in all_hist:
             if len(h) > HISTORY_MAX:
                 del h[: len(h) - HISTORY_MAX]
         # track stage transitions (only when stage actually changes)
@@ -643,11 +654,11 @@ class Renderer:
             f"善者率（{AGENT_LABELS[1]}+{AGENT_LABELS[2]}）：{good*100:5.1f}%",
             True, HUD_DIM), (12, 110))
 
-        # sparkline of 善者率 (right-aligned with histograms)
+        # 5-line strategy time series (right side, below the strategy bars)
         sp_x = WORLD_W - 230
-        sp_y = 96
+        sp_y = 82
         sp_w = 220
-        sp_h = 24
+        sp_h = 56
         # background
         pygame.draw.rect(self.screen, (28, 28, 38),
                          (sp_x, sp_y, sp_w, sp_h))
@@ -655,17 +666,28 @@ class Renderer:
         pygame.draw.line(self.screen, (50, 50, 60),
                          (sp_x, sp_y + sp_h // 2),
                          (sp_x + sp_w, sp_y + sp_h // 2), 1)
-        # the line itself
-        hist = world.good_hist
-        if len(hist) >= 2:
+        # 5 lines, one per AGENT_LABELS, colored with strategy hue
+        for label in AGENT_LABELS:
+            hist = world.cat_hist[label]
+            if len(hist) < 2:
+                continue
+            hue = _hue_for_label(label)
+            color = _hls_to_rgb(hue / 360.0, 0.55, 0.85)
             pts = []
             for i, v in enumerate(hist):
                 px = sp_x + int(i * sp_w / HISTORY_MAX)
                 py = sp_y + sp_h - int(v * sp_h)
                 pts.append((px, py))
-            pygame.draw.lines(self.screen, (110, 220, 150), False, pts, 2)
-        self.screen.blit(self.font_lbl.render("善者率  0.5", True, HUD_DIM),
-                         (sp_x, sp_y - 12))
+            pygame.draw.lines(self.screen, color, False, pts, 1)
+        # legend (5 labels in fixed slots above the chart; use actual text width)
+        legend_y = sp_y - 12
+        slot_w = sp_w // len(AGENT_LABELS)
+        for i, label in enumerate(AGENT_LABELS):
+            hue = _hue_for_label(label)
+            color = _hls_to_rgb(hue / 360.0, 0.55, 0.85)
+            txt_surf = self.font_lbl.render(label, True, color)
+            cx = sp_x + i * slot_w + slot_w // 2
+            self.screen.blit(txt_surf, (cx - txt_surf.get_width() // 2, legend_y))
 
         # 策略分布条形图（右上角，替换旧的 1D 直方图）
         # 5 行 = 5 个 AGENT_LABELS, 颜色 = 该策略的 hue (跟世界圆点同色系)
@@ -675,7 +697,7 @@ class Renderer:
             # frame counter so the user can SEE the loop is running
             self.screen.blit(self.font_lbl.render(
                 f"frame {frame}  step-err {self.step_errors}",
-                True, HUD_DIM), (sp_x, 122))
+                True, HUD_DIM), (sp_x, 150))
 
         # bottom bar
         pygame.draw.rect(self.screen, (20, 20, 28),
@@ -756,6 +778,8 @@ def save_run(world: World, ended_reason: str) -> Path | None:
                 "agg": round(world.agg_hist[i], 4),
                 "coop": round(world.coop_hist[i], 4),
                 "good": round(world.good_hist[i], 4),
+                "cat": {label: round(world.cat_hist[label][i], 4)
+                        for label in AGENT_LABELS},
             }
             for i in range(n)
         ]
@@ -856,7 +880,7 @@ def run_interactive() -> int:
                         elif event.key in (pygame.K_PLUS, pygame.K_EQUALS):
                             speed = min(8.0, speed + 0.5)
                         elif event.key in (pygame.K_MINUS, pygame.K_UNDERSCORE):
-                            speed = max(0.25, speed - 0.5)
+                            speed = max(0.05, speed - 0.5)
                     if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                         mx, my = event.pos
                         if PLAY_OFFSET_Y <= my < PLAY_OFFSET_Y + PLAY_H:
