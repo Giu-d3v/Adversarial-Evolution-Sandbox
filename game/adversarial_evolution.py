@@ -233,6 +233,8 @@ class Agent:
 # ----------------------------------------------------------------------------
 
 class World:
+    AUTOSAVE_INTERVAL = 500  # ticks between autosaves (overwritten in-place)
+
     def __init__(self, w: int = PLAY_W, h: int = PLAY_H) -> None:
         self.w = w
         self.h = h
@@ -241,6 +243,10 @@ class World:
         self.tick = 0
         self.births = 0
         self.deaths = 0
+        # run identity — used as autosave filename so each new run gets its own
+        self.run_id = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        self.autosave_path: Path = RUNS_DIR / f"autosave_{self.run_id}.json"
+        self._last_autosave_tick = 0
         # per-tick metric history (ring buffer of length HISTORY_MAX)
         self.good_hist: List[float] = []     # fraction with cooperation > threshold
         self.pop_hist: List[int] = []
@@ -336,8 +342,15 @@ class World:
         # 5. record metrics history for HUD stage classifier + sparkline
         self._record_metrics()
 
+        # 6. autosave every AUTOSAVE_INTERVAL ticks (overwrites previous autosave)
+        if self.tick - self._last_autosave_tick >= self.AUTOSAVE_INTERVAL:
+            p = save_run(self, "autosave", path=self.autosave_path)
+            self._last_autosave_tick = self.tick
+            if p and os.environ.get("DEBUG_TELEMETRY") == "1":
+                sys.stderr.write(f"[autosave] {p}\n")
+                sys.stderr.flush()
+
         # periodic telemetry (DEBUG_TELEMETRY=1)
-        import os
         if os.environ.get("DEBUG_TELEMETRY") == "1" and self.tick % 50 == 0:
             if self.agents:
                 avg_e = sum(a.energy for a in self.agents) / len(self.agents)
@@ -539,7 +552,6 @@ class Renderer:
         2. SysFont with CJK family names
         3. Pygame default (will show ??? for CJK but won't crash)
         """
-        import os
         # 1. Try explicit CJK font files
         cjk_paths = [
             r"C:\Windows\Fonts\msyh.ttc",   # Microsoft YaHei UI
@@ -694,10 +706,14 @@ class Renderer:
         if world.agents:
             self._strategy_bars(world, sp_x, y=4, w=sp_w)
 
-            # frame counter so the user can SEE the loop is running
+            # frame counter + autosave indicator
             self.screen.blit(self.font_lbl.render(
                 f"frame {frame}  step-err {self.step_errors}",
                 True, HUD_DIM), (sp_x, 150))
+            autosave_age = world.tick - world._last_autosave_tick
+            autosave_str = f"autosave @t{world._last_autosave_tick} (-{autosave_age})"
+            self.screen.blit(self.font_lbl.render(
+                autosave_str, True, HUD_DIM), (sp_x, 160))
 
         # bottom bar
         pygame.draw.rect(self.screen, (20, 20, 28),
@@ -762,13 +778,17 @@ def _hls_to_rgb(h: float, l: float, s: float) -> Tuple[int, int, int]:
 # Main
 # ----------------------------------------------------------------------------
 
-def save_run(world: World, ended_reason: str) -> Path | None:
-    """Dump the current world state + per-tick metrics history to a timestamped
-    JSON file under runs/. Returns the saved path, or None on failure."""
+def save_run(world: World, ended_reason: str, path: Path | None = None) -> Path | None:
+    """Dump the current world state + per-tick metrics history to a JSON file
+    under runs/. If `path` is given (autosave), write there; else use a
+    timestamped filename. Returns the saved path, or None on failure."""
     try:
         RUNS_DIR.mkdir(exist_ok=True)
-        ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        path = RUNS_DIR / f"{ts}.json"
+        if path is None:
+            ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            path = RUNS_DIR / f"{ts}.json"
+        else:
+            ts = path.stem.replace("autosave_", "")  # for payload
         # build time-series (downsampled if too long, but keep all transitions)
         n = len(world.pop_hist)
         history = [
