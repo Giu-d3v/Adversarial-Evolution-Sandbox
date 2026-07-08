@@ -165,6 +165,24 @@ def classify_agent(t: dict) -> str:
     return "未分化"
 
 
+def _hue_for_label(label: str) -> float:
+    """Return the representative hue for a strategy label.
+
+    Reverse of classify_agent: given a label, return the hue that agents
+    of this label are rendered with in the world. Uses trait_hue on a
+    canonical mid-trait position so the HUD bar color matches the dots.
+    """
+    samples = {
+        "夺利":     (0.8, 0.2),    # agg 0.8, coop 0.2
+        "互助合作":  (0.2, 0.8),
+        "好善疾恶":  (0.8, 0.8),
+        "修身":     (0.2, 0.2),
+        "未分化":   (0.5, 0.5),
+    }
+    a, c = samples[label]
+    return trait_hue({"aggression": a, "cooperation": c})
+
+
 # Backward-compat alias — old HUD code called it strategy_label
 strategy_label = classify_agent
 
@@ -599,11 +617,11 @@ class Renderer:
         )
         self.screen.blit(self.font.render(stats, True, HUD_FG), (12, 36))
 
-        # strategy counts (top 3, derived from world._strategy_counts)
+        # strategy counts — show ALL 5 categories in fixed AGENT_LABELS order
+        # (so 0-count categories are visible, not hidden as "top 3")
         if world.agents:
             counts = world._strategy_counts()
-            top = sorted(counts.items(), key=lambda kv: -kv[1])[:3]
-            txt = "  ".join(f"{k} {v}" for k, v in top)
+            txt = "  ".join(f"{label} {counts[label]}" for label in AGENT_LABELS)
             self.screen.blit(self.font.render("策略占比 " + txt, True, HUD_FG),
                              (12, 60))
 
@@ -649,21 +667,10 @@ class Renderer:
         self.screen.blit(self.font_lbl.render("善者存活率  0.5", True, HUD_DIM),
                          (sp_x, sp_y - 12))
 
-        # trait histograms (aggression, cooperation) on right side
+        # 策略分布条形图（右上角，替换旧的 1D 直方图）
+        # 5 行 = 5 个 AGENT_LABELS, 颜色 = 该策略的 hue (跟世界圆点同色系)
         if world.agents:
-            bins_a = [0] * 10
-            bins_c = [0] * 10
-            for a in world.agents:
-                bins_a[min(9, int(a.traits["aggression"] * 10))] += 1
-                bins_c[min(9, int(a.traits["cooperation"] * 10))] += 1
-            # aggression histogram
-            self.screen.blit(self.font_lbl.render("aggression", True, HUD_DIM),
-                             (sp_x, 8))
-            self._bars(bins_a, sp_x, 18, 100, 14)
-            # cooperation histogram
-            self.screen.blit(self.font_lbl.render("cooperation", True, HUD_DIM),
-                             (sp_x + 110, 8))
-            self._bars(bins_c, sp_x + 110, 18, 100, 14)
+            self._strategy_bars(world, sp_x, y=4, w=sp_w)
 
             # frame counter so the user can SEE the loop is running
             self.screen.blit(self.font_lbl.render(
@@ -678,55 +685,44 @@ class Renderer:
         self.screen.blit(self.font.render(help_txt, True, HUD_DIM),
                          (12, WORLD_H - HUD_BOTTOM_H + 18))
 
-    def _bars(self, bins, x, y, w, h) -> None:
-        """Render a single-trait histogram with threshold guide lines.
+    def _strategy_bars(self, world: World, x: int, y: int, w: int) -> None:
+        """5-row horizontal bar chart showing the strategy distribution.
 
-        Visual contract (kept in sync with classify_agent's HIGH/LOW_THRESH):
-        - bins below LOW_THRESH (0.4): one shade
-        - bins between thresholds: another shade (the "未分化" band)
-        - bins at/above HIGH_THRESH (0.6): bright shade (the "高" side)
-        - vertical guide lines drawn at exactly 0.4 and 0.6 bin positions
-        - single neutral hue (NOT rainbow) so strategy meaning comes from
-          the 策略占比 row, not the histogram color
+        Each row = one AGENT_LABELS entry. Bar color = that strategy's hue
+        (matches the world dots via _hue_for_label). Bar length = count.
+        Zero-count strategies get a thin grey track so they remain visible.
+
+        Layout per row: [label 50px] [bar up to 140px] [count 25px]
         """
-        if not bins:
-            return
-        n_bins = len(bins)
-        m = max(bins) or 1
-        bar_w = w // n_bins
+        counts = world._strategy_counts()
+        max_c = max(counts.values()) or 1
+        label_w = 50
+        count_w = 25
+        bar_w_max = max(20, w - label_w - count_w)
+        row_h = 13
+        track_color = (45, 45, 60)   # background track for zero-count rows
 
-        # threshold guide lines (positions in pixels)
-        low_x = x + int(LOW_THRESH * w)
-        high_x = x + int(HIGH_THRESH * w)
-        # draw BEFORE bars so bars can overdraw if needed
-        pygame.draw.line(self.screen, (70, 70, 90),
-                         (low_x, y - 1), (low_x, y + h + 1), 1)
-        pygame.draw.line(self.screen, (70, 70, 90),
-                         (high_x, y - 1), (high_x, y + h + 1), 1)
-        # tiny "low" / "high" tags
-        self.screen.blit(self.font_lbl.render(f"{LOW_THRESH:.1f}", True, (70, 70, 90)),
-                         (low_x - 6, y + h + 2))
-        self.screen.blit(self.font_lbl.render(f"{HIGH_THRESH:.1f}", True, (70, 70, 90)),
-                         (high_x - 6, y + h + 2))
-
-        # bars: 3 shades based on bin mid-point position
-        SHADE_LOW = (90, 110, 140)    # dim blue-gray  (below LOW_THRESH)
-        SHADE_MID = (130, 140, 160)   # neutral        (between)
-        SHADE_HIGH = (190, 195, 215)  # bright         (≥ HIGH_THRESH)
-        for i, b in enumerate(bins):
-            bh = int(h * b / m)
-            if bh == 0:
-                continue
-            bin_mid = (i + 0.5) / n_bins
-            if bin_mid < LOW_THRESH:
-                color = SHADE_LOW
-            elif bin_mid >= HIGH_THRESH:
-                color = SHADE_HIGH
-            else:
-                color = SHADE_MID
-            pygame.draw.rect(
-                self.screen, color,
-                (x + i * bar_w, y + h - bh, bar_w - 1, bh),
+        for i, label in enumerate(AGENT_LABELS):
+            row_y = y + i * row_h
+            c = counts[label]
+            # label
+            self.screen.blit(self.font_lbl.render(label, True, HUD_FG),
+                             (x, row_y + 1))
+            # background track (always drawn, even if count is 0)
+            bar_x = x + label_w
+            pygame.draw.rect(self.screen, track_color,
+                             (bar_x, row_y + 3, bar_w_max, 8))
+            # colored bar
+            if c > 0:
+                hue = _hue_for_label(label)
+                color = _hls_to_rgb(hue / 360.0, 0.55, 0.75)
+                bw = max(2, int(bar_w_max * c / max_c))
+                pygame.draw.rect(self.screen, color,
+                                 (bar_x, row_y + 3, bw, 8))
+            # count
+            self.screen.blit(
+                self.font_lbl.render(str(c), True, HUD_DIM),
+                (x + label_w + bar_w_max + 4, row_y + 1),
             )
 
 
