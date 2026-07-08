@@ -123,6 +123,7 @@ def build_timeseries(runs: List[Dict[str, Any]], downsample: int = 0) -> go.Figu
         vertical_spacing=0.06,
     )
     metric_keys = [("agg", 1), ("coop", 2), ("good", 3), ("pop", 4)]
+    # good subplot (row 3) also gets a dashed coopOnly line so 善者 vs 合作者对比可见
     for i, run in enumerate(runs):
         color = RUN_COLORS[i % len(RUN_COLORS)]
         label = run["_label"]
@@ -140,6 +141,18 @@ def build_timeseries(runs: List[Dict[str, Any]], downsample: int = 0) -> go.Figu
                     hovertemplate=f"{key}=%{{y:.3f}}<br>tick=%{{x}}<extra>{escape(label)}</extra>",
                 ),
                 row=row, col=1,
+            )
+        # coopOnly overlay on the good subplot (dashed, half-width)
+        if any("coopOnly" in h for h in history):
+            ys_co = [h.get("coopOnly", 0) for h in history]
+            fig.add_trace(
+                go.Scatter(
+                    x=xs, y=ys_co, mode="lines", name=f"{label} (合作者率)",
+                    legendgroup=label, showlegend=False,
+                    line=dict(color=color, width=1, dash="dot"),
+                    hovertemplate=f"coopOnly=%{{y:.3f}}<br>tick=%{{x}}<extra>{escape(label)}</extra>",
+                ),
+                row=3, col=1,
             )
     fig.update_layout(
         height=700, hovermode="x unified",
@@ -347,6 +360,7 @@ def build_summary(runs: List[Dict[str, Any]]) -> Tuple[go.Figure, go.Figure, str
             f"<td>{f.get('avgAgg', 0):.3f}</td>"
             f"<td>{f.get('avgCoop', 0):.3f}</td>"
             f"<td>{f.get('goodRate', 0):.3f}</td>"
+            f"<td>{f.get('coopOnlyRate', 0):.3f}</td>"
             f"<td style='color:{_stage_color(stage)}'>{escape(stage)}</td>"
             f"<td>{f.get('maxGen', '?')}</td></tr>"
         )
@@ -355,7 +369,7 @@ def build_summary(runs: List[Dict[str, Any]]) -> Tuple[go.Figure, go.Figure, str
         "<table style='border-collapse:collapse;width:100%;font-family:monospace;font-size:13px'>"
         "<thead><tr style='background:#222;color:#ddd'>"
         "<th>文件名</th><th>ticks</th><th>退出</th><th>pop</th>"
-        "<th>avgAgg</th><th>avgCoop</th><th>good</th><th>末态阶段</th><th>maxGen</th>"
+        "<th>avgAgg</th><th>avgCoop</th><th>good</th><th>合作者</th><th>末态阶段</th><th>maxGen</th>"
         "</tr></thead><tbody>" + "".join(rows_html) + "</tbody></table>"
     )
     return fig_dist, fig_scatter, table_html

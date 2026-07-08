@@ -183,6 +183,19 @@ def _hue_for_label(label: str) -> float:
     return trait_hue({"aggression": a, "cooperation": c})
 
 
+def _label_color(label: str, light: float = 0.55, sat: float = 0.75) -> tuple:
+    """RGB color for a strategy label, with 未分化 rendered as gray.
+
+    Gray makes the "未分化" catch-all visually distinct from the 4 vivid
+    corner strategies (which sit at 90° hue intervals). Sat=0 collapses
+    the color to neutral gray regardless of hue.
+    """
+    if label == "未分化":
+        return _hls_to_rgb(0.0, light, 0.0)   # gray
+    hue = _hue_for_label(label)
+    return _hls_to_rgb(hue / 360.0, light, sat)
+
+
 # Backward-compat alias — old HUD code called it strategy_label
 strategy_label = classify_agent
 
@@ -248,7 +261,8 @@ class World:
         self.autosave_path: Path = RUNS_DIR / f"autosave_{self.run_id}.json"
         self._last_autosave_tick = 0
         # per-tick metric history (ring buffer of length HISTORY_MAX)
-        self.good_hist: List[float] = []     # fraction with cooperation > threshold
+        self.good_hist: List[float] = []     # 善者率: (互助合作+好善疾恶) / pop
+        self.coop_only_hist: List[float] = []  # 合作者率: 互助合作 / pop
         self.pop_hist: List[int] = []
         self.agg_hist: List[float] = []
         self.coop_hist: List[float] = []
@@ -459,6 +473,16 @@ class World:
         good = counts["互助合作"] + counts["好善疾恶"]
         return good / len(self.agents)
 
+    def coop_only_rate(self) -> float:
+        """Fraction of agents that are pure 互助合作 (cooperators only,
+        excluding 好善疾恶 'judges'). Distinguishes passive cooperator
+        share from the broader 善者 pool.
+        """
+        if not self.agents:
+            return 0.0
+        counts = self._strategy_counts()
+        return counts["互助合作"] / len(self.agents)
+
     def _avg_trait(self, name: str) -> float:
         if not self.agents:
             return 0.0
@@ -466,6 +490,7 @@ class World:
 
     def _record_metrics(self) -> None:
         self.good_hist.append(self.good_rate())
+        self.coop_only_hist.append(self.coop_only_rate())
         self.pop_hist.append(len(self.agents))
         self.agg_hist.append(self._avg_trait("aggression"))
         self.coop_hist.append(self._avg_trait("cooperation"))
@@ -475,7 +500,8 @@ class World:
         for label in AGENT_LABELS:
             self.cat_hist[label].append(counts[label] / pop)
         # trim to ring buffer length
-        all_hist = (self.good_hist, self.pop_hist, self.agg_hist, self.coop_hist,
+        all_hist = (self.good_hist, self.coop_only_hist, self.pop_hist,
+                    self.agg_hist, self.coop_hist,
                     *[self.cat_hist[l] for l in AGENT_LABELS])
         for h in all_hist:
             if len(h) > HISTORY_MAX:
@@ -608,11 +634,16 @@ class Renderer:
 
     def _draw_agents(self, world: World) -> None:
         for a in world.agents:
-            hue = trait_hue(a.traits)
-            # saturation a bit muted, lightness by energy
-            sat = 0.55 + 0.35 * (1.0 - abs(a.traits["aggression"] - a.traits["cooperation"]))
             light = 0.45 + 0.25 * (a.energy / MAX_ENERGY)
-            color = _hls_to_rgb(hue / 360.0, light, sat)
+            # center agents (未分化) are gray so they don't blur with 好善疾恶 (yellow-green)
+            dx = abs(a.traits["aggression"] - 0.5)
+            dy = abs(a.traits["cooperation"] - 0.5)
+            if dx < 0.04 and dy < 0.04:
+                color = _hls_to_rgb(0.0, light, 0.0)  # gray
+            else:
+                hue = trait_hue(a.traits)
+                sat = 0.55 + 0.35 * (1.0 - abs(a.traits["aggression"] - a.traits["cooperation"]))
+                color = _hls_to_rgb(hue / 360.0, light, sat)
             r = 3 + int(6 * (a.energy / MAX_ENERGY))
             pygame.draw.circle(
                 self.screen,
@@ -662,9 +693,13 @@ class Renderer:
             stage_color = HUD_FG
         self.screen.blit(self.font_big.render(f"阶段：{stage}", True, stage_color),
                          (12, 84))
+        coop_only = world.coop_only_rate()
         self.screen.blit(self.font.render(
             f"善者率（{AGENT_LABELS[1]}+{AGENT_LABELS[2]}）：{good*100:5.1f}%",
             True, HUD_DIM), (12, 110))
+        self.screen.blit(self.font.render(
+            f"合作者率（{AGENT_LABELS[1]}）：{coop_only*100:5.1f}%",
+            True, HUD_DIM), (12, 126))
 
         # 5-line strategy time series (right side, below the strategy bars)
         sp_x = WORLD_W - 230
@@ -683,8 +718,7 @@ class Renderer:
             hist = world.cat_hist[label]
             if len(hist) < 2:
                 continue
-            hue = _hue_for_label(label)
-            color = _hls_to_rgb(hue / 360.0, 0.55, 0.85)
+            color = _label_color(label, light=0.55, sat=0.85)
             pts = []
             for i, v in enumerate(hist):
                 px = sp_x + int(i * sp_w / HISTORY_MAX)
@@ -695,8 +729,7 @@ class Renderer:
         legend_y = sp_y - 12
         slot_w = sp_w // len(AGENT_LABELS)
         for i, label in enumerate(AGENT_LABELS):
-            hue = _hue_for_label(label)
-            color = _hls_to_rgb(hue / 360.0, 0.55, 0.85)
+            color = _label_color(label, light=0.55, sat=0.85)
             txt_surf = self.font_lbl.render(label, True, color)
             cx = sp_x + i * slot_w + slot_w // 2
             self.screen.blit(txt_surf, (cx - txt_surf.get_width() // 2, legend_y))
@@ -750,10 +783,9 @@ class Renderer:
             bar_x = x + label_w
             pygame.draw.rect(self.screen, track_color,
                              (bar_x, row_y + 3, bar_w_max, 8))
-            # colored bar
+            # colored bar (未分化 = gray via _label_color)
             if c > 0:
-                hue = _hue_for_label(label)
-                color = _hls_to_rgb(hue / 360.0, 0.55, 0.75)
+                color = _label_color(label, light=0.55, sat=0.75)
                 bw = max(2, int(bar_w_max * c / max_c))
                 pygame.draw.rect(self.screen, color,
                                  (bar_x, row_y + 3, bw, 8))
@@ -798,6 +830,7 @@ def save_run(world: World, ended_reason: str, path: Path | None = None) -> Path 
                 "agg": round(world.agg_hist[i], 4),
                 "coop": round(world.coop_hist[i], 4),
                 "good": round(world.good_hist[i], 4),
+                "coopOnly": round(world.coop_only_hist[i], 4),
                 "cat": {label: round(world.cat_hist[label][i], 4)
                         for label in AGENT_LABELS},
             }
@@ -814,6 +847,7 @@ def save_run(world: World, ended_reason: str, path: Path | None = None) -> Path 
                 "avgAgg": round(world._avg_trait("aggression"), 4),
                 "avgCoop": round(world._avg_trait("cooperation"), 4),
                 "goodRate": round(world.good_rate(), 4),
+                "coopOnlyRate": round(world.coop_only_rate(), 4),
                 "stage": world.current_stage(),
                 "maxGen": max((a.generation for a in world.agents), default=0),
                 "food": len(world.food),
