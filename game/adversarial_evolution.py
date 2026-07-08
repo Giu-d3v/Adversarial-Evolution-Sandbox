@@ -625,7 +625,7 @@ class Renderer:
             self.screen.blit(self.font.render("策略占比 " + txt, True, HUD_FG),
                              (12, 60))
 
-        # ===== STAGE LABEL + 善者存活率 SPARKLINE =====
+        # ===== STAGE LABEL + 善者率 SPARKLINE =====
         stage = world.current_stage()
         good = world.good_rate()
         # color stage label based on category
@@ -640,10 +640,10 @@ class Renderer:
         self.screen.blit(self.font_big.render(f"阶段：{stage}", True, stage_color),
                          (12, 84))
         self.screen.blit(self.font.render(
-            f"善者存活率（{AGENT_LABELS[1]}+{AGENT_LABELS[2]}）：{good*100:5.1f}%",
+            f"善者率（{AGENT_LABELS[1]}+{AGENT_LABELS[2]}）：{good*100:5.1f}%",
             True, HUD_DIM), (12, 110))
 
-        # sparkline of 善者存活率 (right-aligned with histograms)
+        # sparkline of 善者率 (right-aligned with histograms)
         sp_x = WORLD_W - 230
         sp_y = 96
         sp_w = 220
@@ -664,7 +664,7 @@ class Renderer:
                 py = sp_y + sp_h - int(v * sp_h)
                 pts.append((px, py))
             pygame.draw.lines(self.screen, (110, 220, 150), False, pts, 2)
-        self.screen.blit(self.font_lbl.render("善者存活率  0.5", True, HUD_DIM),
+        self.screen.blit(self.font_lbl.render("善者率  0.5", True, HUD_DIM),
                          (sp_x, sp_y - 12))
 
         # 策略分布条形图（右上角，替换旧的 1D 直方图）
