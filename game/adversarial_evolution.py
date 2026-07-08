@@ -93,14 +93,29 @@ def gauss(mu: float, sigma: float) -> float:
 def trait_hue(t: dict) -> float:
     """Map (aggression, cooperation) position to hue [0,360].
     Lets the player SEE strategies emerge without labeling them.
-        hue 0   (red)    = high agg, low coop     -> 夺利-ish
-        hue 120 (green)  = high coop, low agg     -> 合作-ish
-        hue 300 (purple) = low both               -> 修身-ish
+
+    Cardinal corners map to intuitive colors:
+        agg=1, coop=0  -> hue 0   (红, red)    -> 夺利
+        agg=0, coop=1  -> hue 180 (青, cyan)   -> 互助合作 (cool family)
+        agg=0, coop=0  -> hue 270 (蓝紫, violet) -> 修身
+        agg=1, coop=1  -> hue 90  (黄绿, yellow-green) -> GVBE 好善疾恶
+        near center    -> hue 60  (黄, yellow)  -> 未分化
+
+    Note: due to trait-space being a 90°-cornered square while target hues
+    are 60°/120° apart, no single linear rotation hits all 4 corners exactly.
+    This formula prioritizes 夺利=red (the most visually important distinction).
     """
     dx = t["aggression"] - 0.5
     dy = t["cooperation"] - 0.5
-    # atan2 returns [-pi, pi]; shift so (dx=+, dy=0) -> 0 (red)
-    return (math.degrees(math.atan2(dx, dy)) + 360.0) % 360.0
+    # center special-case: very close to (0.5, 0.5) -> yellow (未分化)
+    if abs(dx) < 0.04 and abs(dy) < 0.04:
+        return 60.0
+    # atan2(dx+dy, dx-dy) rotates trait space 45° and maps:
+    #   (1,0) -> (0.5, 0.5) → atan2(0.5,0.5) = 0°   ✓ red
+    #   (0,1) -> (-0.5,-0.5) → atan2(-0.5,-0.5) = 180° cyan
+    #   (0,0) -> (-0.5, 0.5) → atan2(-0.5,0.5) = 270° purple ✓
+    #   (1,1) -> (0.5, -0.5) → atan2(0.5,-0.5) = 90°  yellow-green
+    return (math.degrees(math.atan2(dx + dy, dx - dy)) + 360.0) % 360.0
 
 
 def strategy_label(t: dict) -> str:
