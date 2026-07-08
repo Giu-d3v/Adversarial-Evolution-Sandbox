@@ -40,8 +40,15 @@ INIT_FOOD = 240
 FOOD_TARGET = 140              # ABSOLUTE food target (not per-capita)
 FOOD_SPAWN_PER_TICK = 3       # cap food supply so pop can't grow forever
 
-# "善者" 定义：cooperation 性状高于此阈值视为好善疾恶倾向
-GOOD_COOP_THRESHOLD = 0.5
+# === Strategy classification (single source of truth) ===
+# All HUD elements (strategy counts, stage label, good-rate, histograms)
+# derive from classify_agent() and these shared thresholds. Do NOT introduce
+# other classification thresholds elsewhere.
+HIGH_THRESH = 0.6   # trait ≥ 此值 = "高" (e.g. high aggression → 夺利 / GVBE)
+LOW_THRESH  = 0.4   # trait <  此值 = "低"
+# AGENT_LABELS is the canonical list, in a stable display order
+AGENT_LABELS = ("夺利", "互助合作", "好善疾恶", "修身", "未分化")
+
 HISTORY_MAX = 220              # HUD sparkline 保留多少 tick 的历史
 
 # session logging
@@ -118,20 +125,48 @@ def trait_hue(t: dict) -> float:
     return (math.degrees(math.atan2(dx + dy, dx - dy)) + 360.0) % 360.0
 
 
-def strategy_label(t: dict) -> str:
-    """Soft heuristic label for HUD only. Game logic does not use this."""
-    agg, coop, met = t["aggression"], t["cooperation"], t["metabolism"]
-    if agg > 0.62 and coop < 0.4:
+def classify_agent(t: dict) -> str:
+    """Per-agent strategy label based on (aggression, cooperation) position.
+
+    SINGLE SOURCE OF TRUTH for what each agent "is". All other UI elements
+    (strategy counts, stage classifier, good-rate, histograms) derive from
+    this function and the shared HIGH_THRESH / LOW_THRESH constants.
+
+    Trait space is divided into 4 corner quadrants + 1 catch-all center:
+
+        coop
+         1 ┌────────────┬────────────┐
+           │ 互助合作   │  好善疾恶  │
+           │ (high coop │ (high agg  │
+           │  low agg)  │  high coop)│
+       0.6├────────────┼────────────┤ ← HIGH_THRESH
+           │            │            │
+       0.4├────────────┼────────────┤ ← LOW_THRESH
+           │  修身      │   夺利    │
+           │ (low both) │ (high agg │
+           │            │  low coop) │
+         0 └────────────┴────────────┘
+         0    0.4    0.6    1     agg
+    """
+    agg = t["aggression"]
+    coop = t["cooperation"]
+    high_agg = agg >= HIGH_THRESH
+    low_agg = agg < LOW_THRESH
+    high_coop = coop >= HIGH_THRESH
+    low_coop = coop < LOW_THRESH
+    if high_agg and low_coop:
         return "夺利"
-    if coop > 0.62 and agg < 0.4:
+    if high_coop and low_agg:
         return "互助合作"
-    if agg < 0.35 and coop < 0.35 and met < 0.4:
-        return "修身"
-    if agg > 0.55 and coop > 0.55:
+    if high_agg and high_coop:
         return "好善疾恶"
-    if 0.4 <= agg <= 0.65 and 0.4 <= coop <= 0.65:
-        return "未分化"
-    return "中间态"
+    if low_agg and low_coop:
+        return "修身"
+    return "未分化"
+
+
+# Backward-compat alias — old HUD code called it strategy_label
+strategy_label = classify_agent
 
 
 # ----------------------------------------------------------------------------
@@ -372,12 +407,22 @@ class World:
             newborns.append(a.mutate_child())
 
     # -- metrics & stage classification ------------------------------------
+    def _strategy_counts(self) -> dict:
+        """Count agents per AGENT_LABELS using classify_agent.
+        This is the canonical population distribution used by all UI."""
+        from collections import Counter
+        c = Counter(classify_agent(a.traits) for a in self.agents)
+        return {label: c.get(label, 0) for label in AGENT_LABELS}
+
     def good_rate(self) -> float:
-        """Fraction of agents whose cooperation trait exceeds GOOD_COOP_THRESHOLD."""
+        """Fraction of agents that are 互助合作 OR 好善疾恶 (i.e. high-coop).
+        Derived from classify_agent — matches the '善者' definition exactly.
+        """
         if not self.agents:
             return 0.0
-        n = sum(1 for a in self.agents if a.traits["cooperation"] > GOOD_COOP_THRESHOLD)
-        return n / len(self.agents)
+        counts = self._strategy_counts()
+        good = counts["互助合作"] + counts["好善疾恶"]
+        return good / len(self.agents)
 
     def _avg_trait(self, name: str) -> float:
         if not self.agents:
@@ -400,45 +445,49 @@ class World:
             self._last_stage = stage
 
     def current_stage(self) -> str:
-        """Classify the current population into a book-derived label.
-        Order matters — first matching rule wins."""
+        """Population-level label derived entirely from classify_agent counts.
+
+        Strategy counts are first computed by classify_agent; stage rules are
+        pure fractions (p_X = counts[X] / pop). No raw avgAgg/avgCoop here —
+        those thresholds are decoupled to avoid inconsistent classification.
+        """
         if not self.agents:
             return "空"
         if self.tick < 60:
             return "起始混乱"
 
         pop = len(self.agents)
-        agg = self._avg_trait("aggression")
-        coop = self._avg_trait("cooperation")
-        good = self.good_rate()
+        c = self._strategy_counts()
+        p_grab = c["夺利"] / pop
+        p_coop = c["互助合作"] / pop
+        p_gvbe = c["好善疾恶"] / pop
+        p_self = c["修身"] / pop
+        p_high_coop = p_coop + p_gvbe   # 互助合作 ∪ 好善疾恶 = 善者
 
         # pop trend over last ~60 ticks
         window = self.pop_hist[-60:] if len(self.pop_hist) >= 60 else self.pop_hist[:]
         pop_delta = (window[-1] - window[0]) if len(window) >= 2 else 0
+        pop_delta_abs = abs(pop_delta)
 
-        # collapse = both pop falling AND cooperation dying
+        # Priority order — first matching rule wins
         if pop < 25:
             return "濒临灭绝"
-        if agg > 0.72 and coop < 0.40:
+        if p_grab >= 0.60:
             return "霍布斯丛林"
-        # 伊甸园: sustained high coop + low agg + pop stable
-        if coop > 0.55 and agg < 0.50 and abs(pop_delta) < 20:
-            return "伊甸园期"
-        # 合作繁荣中: coop high + pop growing fast
-        if coop > 0.50 and agg < 0.55 and pop_delta > 25:
+        if p_high_coop >= 0.50 and pop >= 100:
+            if pop_delta_abs < 20:
+                return "伊甸园期"
             return "合作繁荣中"
-        # 维度坍缩: pop crashing hard
+        if p_self >= 0.50:
+            return "修身主导"
+        if p_gvbe >= 0.30:
+            return "好善疾恶主导"
+        if p_grab >= 0.40:
+            return "夺利丛林"
         if pop_delta < -40:
             return "维度坍缩中"
-        # 夺利丛林 (clearly red)
-        if agg > 0.62:
-            return "夺利丛林"
-        # 朴素合作 (visible green cluster)
-        if coop > 0.48 and good > 0.35:
-            return "朴素合作"
-        # 修身主导
-        if agg < 0.40 and coop < 0.40:
-            return "修身主导"
+        if pop_delta > 25:
+            return "增长中"
         return "未分化"
 
 
@@ -550,12 +599,9 @@ class Renderer:
         )
         self.screen.blit(self.font.render(stats, True, HUD_FG), (12, 36))
 
-        # strategy counts (top 3)
+        # strategy counts (top 3, derived from world._strategy_counts)
         if world.agents:
-            counts: dict[str, int] = {}
-            for a in world.agents:
-                lbl = strategy_label(a.traits)
-                counts[lbl] = counts.get(lbl, 0) + 1
+            counts = world._strategy_counts()
             top = sorted(counts.items(), key=lambda kv: -kv[1])[:3]
             txt = "  ".join(f"{k} {v}" for k, v in top)
             self.screen.blit(self.font.render("策略占比 " + txt, True, HUD_FG),
@@ -576,7 +622,7 @@ class Renderer:
         self.screen.blit(self.font_big.render(f"阶段：{stage}", True, stage_color),
                          (12, 84))
         self.screen.blit(self.font.render(
-            f"善者存活率（合作 > {GOOD_COOP_THRESHOLD:.1f}）：{good*100:5.1f}%",
+            f"善者存活率（{AGENT_LABELS[1]}+{AGENT_LABELS[2]}）：{good*100:5.1f}%",
             True, HUD_DIM), (12, 110))
 
         # sparkline of 善者存活率 (right-aligned with histograms)
@@ -610,11 +656,11 @@ class Renderer:
             for a in world.agents:
                 bins_a[min(9, int(a.traits["aggression"] * 10))] += 1
                 bins_c[min(9, int(a.traits["cooperation"] * 10))] += 1
-            # agg
+            # aggression histogram
             self.screen.blit(self.font_lbl.render("aggression", True, HUD_DIM),
                              (sp_x, 8))
             self._bars(bins_a, sp_x, 18, 100, 14)
-            # coop
+            # cooperation histogram
             self.screen.blit(self.font_lbl.render("cooperation", True, HUD_DIM),
                              (sp_x + 110, 8))
             self._bars(bins_c, sp_x + 110, 18, 100, 14)
@@ -633,15 +679,53 @@ class Renderer:
                          (12, WORLD_H - HUD_BOTTOM_H + 18))
 
     def _bars(self, bins, x, y, w, h) -> None:
+        """Render a single-trait histogram with threshold guide lines.
+
+        Visual contract (kept in sync with classify_agent's HIGH/LOW_THRESH):
+        - bins below LOW_THRESH (0.4): one shade
+        - bins between thresholds: another shade (the "未分化" band)
+        - bins at/above HIGH_THRESH (0.6): bright shade (the "高" side)
+        - vertical guide lines drawn at exactly 0.4 and 0.6 bin positions
+        - single neutral hue (NOT rainbow) so strategy meaning comes from
+          the 策略占比 row, not the histogram color
+        """
         if not bins:
             return
+        n_bins = len(bins)
         m = max(bins) or 1
-        bar_w = w // len(bins)
+        bar_w = w // n_bins
+
+        # threshold guide lines (positions in pixels)
+        low_x = x + int(LOW_THRESH * w)
+        high_x = x + int(HIGH_THRESH * w)
+        # draw BEFORE bars so bars can overdraw if needed
+        pygame.draw.line(self.screen, (70, 70, 90),
+                         (low_x, y - 1), (low_x, y + h + 1), 1)
+        pygame.draw.line(self.screen, (70, 70, 90),
+                         (high_x, y - 1), (high_x, y + h + 1), 1)
+        # tiny "low" / "high" tags
+        self.screen.blit(self.font_lbl.render(f"{LOW_THRESH:.1f}", True, (70, 70, 90)),
+                         (low_x - 6, y + h + 2))
+        self.screen.blit(self.font_lbl.render(f"{HIGH_THRESH:.1f}", True, (70, 70, 90)),
+                         (high_x - 6, y + h + 2))
+
+        # bars: 3 shades based on bin mid-point position
+        SHADE_LOW = (90, 110, 140)    # dim blue-gray  (below LOW_THRESH)
+        SHADE_MID = (130, 140, 160)   # neutral        (between)
+        SHADE_HIGH = (190, 195, 215)  # bright         (≥ HIGH_THRESH)
         for i, b in enumerate(bins):
             bh = int(h * b / m)
+            if bh == 0:
+                continue
+            bin_mid = (i + 0.5) / n_bins
+            if bin_mid < LOW_THRESH:
+                color = SHADE_LOW
+            elif bin_mid >= HIGH_THRESH:
+                color = SHADE_HIGH
+            else:
+                color = SHADE_MID
             pygame.draw.rect(
-                self.screen,
-                _hls_to_rgb(i / len(bins) * 0.8 + 0.05, 0.55, 0.7),
+                self.screen, color,
                 (x + i * bar_w, y + h - bh, bar_w - 1, bh),
             )
 
