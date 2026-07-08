@@ -609,16 +609,6 @@ class Renderer:
                 f"frame {frame}  step-err {self.step_errors}",
                 True, HUD_DIM), (sp_x, 122))
 
-            # dominant strategy hint
-            counts: dict[str, int] = {}
-            for a in world.agents:
-                lbl = strategy_label(a.traits)
-                counts[lbl] = counts.get(lbl, 0) + 1
-            top = sorted(counts.items(), key=lambda kv: -kv[1])[:3]
-            txt = "  ".join(f"{k} {v}" for k, v in top)
-            self.screen.blit(self.font.render("策略占比 " + txt, True, HUD_FG),
-                             (12, 60))
-
         # bottom bar
         pygame.draw.rect(self.screen, (20, 20, 28),
                          (0, WORLD_H - HUD_BOTTOM_H, WORLD_W, HUD_BOTTOM_H))
